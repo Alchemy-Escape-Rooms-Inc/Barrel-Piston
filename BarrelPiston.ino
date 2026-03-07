@@ -31,6 +31,7 @@ const int RELAY_RETRACT_PIN = 17;    // GPIO17
 const int LED_PIN           = 25;    // Status LED
 
 // Timing
+const uint32_t CMD_TIMEOUT_MS      = 120000;   // auto-stop and clear all statuses after 2 min
 const uint32_t WATCHDOG_REBOOT_MS  = 600000;   // reboot after 10 min inactivity
 const uint32_t INTERLOCK_GAP_MS    = 120;      // gap when swapping direction
 const uint32_t BACKOFF_MAX_MS      = 30000;
@@ -96,8 +97,12 @@ void toStopped(const char* reason=nullptr) {
   want_engage = false;
   want_retract = false;
   setRelays(false, false);
+  // Clear ALL MQTT statuses so nothing stays stale
   publishStatus("STOPPED");
+  mqtt.publish(T_ENGAGE, "0", true);
+  mqtt.publish(T_RETRACT, "0", true);
   if (reason) publishSafety(reason);
+  publishSafety("CLEAR", true);
   Serial.printf("State: STOPPED (%s)\n", reason ? reason : "manual");
 }
 
@@ -386,6 +391,12 @@ void loop() {
   }
 
   uint32_t now = millis();
+
+  // Auto-stop and clear all statuses after timeout
+  if ((state == PistonState::ENGAGING || state == PistonState::RETRACTING) &&
+      (now - last_cmd_ms > CMD_TIMEOUT_MS)) {
+    toStopped("TIMEOUT_STOP");
+  }
 
   // Watchdog: reboot after long inactivity (no commands)
   if (last_activity_ms>0 && (now - last_activity_ms > WATCHDOG_REBOOT_MS)) {
