@@ -140,6 +140,9 @@ void safetyShutdown(const char* why) {
   state=PistonState::SAFETY;
   want_engage = false;
   want_retract = false;
+  // Clear retained command topics so stale "1" doesn't re-trigger after reboot
+  mqtt.publish(T_ENGAGE, "0", true);
+  mqtt.publish(T_RETRACT, "0", true);
   led.set(80); // fast blink
   publishSafety(why);
   Serial.printf("SAFETY SHUTDOWN: %s\n", why);
@@ -186,8 +189,12 @@ void processDesiredState() {
     return;
   }
   
-  // If in safety mode, ignore commands until reset
+  // If in safety mode, only allow clearing (both wants false = reset)
   if (state == PistonState::SAFETY) {
+    if (!want_engage && !want_retract) {
+      toStopped("SAFETY_CLEARED");
+      Serial.println("Safety mode cleared by operator reset");
+    }
     return;
   }
   
@@ -392,10 +399,12 @@ void loop() {
 
   uint32_t now = millis();
 
-  // Auto-stop and clear all statuses after timeout
-  if ((state == PistonState::ENGAGING || state == PistonState::RETRACTING) &&
+  // Auto-stop and clear all statuses after timeout (includes SAFETY auto-clear)
+  if ((state == PistonState::ENGAGING || state == PistonState::RETRACTING ||
+       state == PistonState::SAFETY) &&
       (now - last_cmd_ms > CMD_TIMEOUT_MS)) {
     toStopped("TIMEOUT_STOP");
+    Serial.println("Auto-cleared state after timeout");
   }
 
   // Watchdog: reboot after long inactivity (no commands)
