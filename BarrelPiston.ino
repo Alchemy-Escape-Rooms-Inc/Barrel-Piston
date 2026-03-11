@@ -31,7 +31,7 @@ const int RELAY_RETRACT_PIN = 17;    // GPIO17
 const int LED_PIN           = 25;    // Status LED
 
 // Timing
-const uint32_t CMD_TIMEOUT_MS      = 5000;     // auto-stop piston after no command
+const uint32_t CMD_TIMEOUT_MS      = 120000;   // auto-stop and clear all statuses after 2 min
 const uint32_t WATCHDOG_REBOOT_MS  = 600000;   // reboot after 10 min inactivity
 const uint32_t INTERLOCK_GAP_MS    = 120;      // gap when swapping direction
 const uint32_t BACKOFF_MAX_MS      = 30000;
@@ -84,6 +84,8 @@ void setRelays(bool engage_on, bool retract_on) {
   // If your relay board is active-LOW, invert these writes.
   digitalWrite(RELAY_ENGAGE_PIN, engage_on ? HIGH : LOW);
   digitalWrite(RELAY_RETRACT_PIN, retract_on ? HIGH : LOW);
+  relay_engage_intended = engage_on;
+  relay_retract_intended = retract_on;
 }
 
 void publishStatus(const char* s, bool retained=false){ mqtt.publish(T_STATUS, s, retained); }
@@ -95,8 +97,12 @@ void toStopped(const char* reason=nullptr) {
   want_engage = false;
   want_retract = false;
   setRelays(false, false);
+  // Clear ALL MQTT statuses so nothing stays stale
   publishStatus("STOPPED");
+  mqtt.publish(T_ENGAGE, "0", true);
+  mqtt.publish(T_RETRACT, "0", true);
   if (reason) publishSafety(reason);
+  publishSafety("CLEAR", true);
   Serial.printf("State: STOPPED (%s)\n", reason ? reason : "manual");
 }
 
@@ -386,11 +392,9 @@ void loop() {
 
   uint32_t now = millis();
 
-  // Auto-stop after timeout while motion requested
-  if ((state==PistonState::ENGAGING || state==PistonState::RETRACTING) &&
+  // Auto-stop and clear all statuses after timeout
+  if ((state == PistonState::ENGAGING || state == PistonState::RETRACTING) &&
       (now - last_cmd_ms > CMD_TIMEOUT_MS)) {
-    want_engage = false;
-    want_retract = false;
     toStopped("TIMEOUT_STOP");
   }
 
