@@ -36,8 +36,8 @@ const char* T_GPIO2_STATE = "MermaidsTale/BarrelPiston/GPIO2/State";
 const char* T_GPIO4_STATE = "MermaidsTale/BarrelPiston/GPIO4/State";
 
 // Pins (ESP32-S3 compatible)
-const int RELAY_EXTEND_PIN  = 16;
-const int RELAY_RETRACT_PIN = 17;
+const int RELAY_EXTEND_PIN  = 2;
+const int RELAY_RETRACT_PIN = 4;
 const int LED_PIN           = -1;  // Disabled for ESP32-S3
 
 // Timing
@@ -173,8 +173,9 @@ void setLastError(const char* msg) {
 }
 
 void setRelays(bool extend_on, bool retract_on) {
-  digitalWrite(RELAY_EXTEND_PIN,  extend_on  ? HIGH : LOW);
-  digitalWrite(RELAY_RETRACT_PIN, retract_on ? HIGH : LOW);
+  // Active LOW relays - LOW = ON, HIGH = OFF
+  digitalWrite(RELAY_EXTEND_PIN,  extend_on  ? LOW : HIGH);
+  digitalWrite(RELAY_RETRACT_PIN, retract_on ? LOW : HIGH);
 
   relay_extend_intended  = extend_on;
   relay_retract_intended = retract_on;
@@ -499,10 +500,9 @@ void mqttConnectIfNeeded() {
     snprintf(info, sizeof(info), "%s Ready - IP: %s", DEVICE_NAME, WiFi.localIP().toString().c_str());
     publishRetained(T_INFO, info);
 
-    pinMode(2, INPUT);
-    pinMode(4, INPUT);
-    publishGpioState(2, T_GPIO2_STATE);
-    publishGpioState(4, T_GPIO4_STATE);
+    // GPIO 2 and 4 are used for relays, not aux GPIO
+    // publishGpioState(2, T_GPIO2_STATE);
+    // publishGpioState(4, T_GPIO4_STATE);
 
     publishFullStatus();
     led.solid(true);
@@ -574,8 +574,7 @@ void setup() {
   pinMode(RELAY_RETRACT_PIN, OUTPUT);
   allRelaysOff();
 
-  pinMode(2, INPUT);
-  pinMode(4, INPUT);
+  // GPIO 2 and 4 are used for relays, not aux GPIO
 
   setLastError("NONE");
 
