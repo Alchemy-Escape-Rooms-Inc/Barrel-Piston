@@ -6,7 +6,7 @@
 
 #define DEVICE_NAME           "BarrelPiston"
 #define FIRMWARE_VERSION      "2.0.1"
-#define BOARD_TYPE            "ESP32"
+#define BOARD_TYPE            "ESP32-S3"
 #define ROOM                  "MermaidsTale"
 #define DESCRIPTION           "Pulse-based barrel piston controller with single MQTT command topic, interlock protection, GPIO2/4 aux outputs, watchdog reboot, and device telemetry"
 
@@ -24,7 +24,7 @@
 #define SUPPORTED_COMMANDS    "EXTEND, RETRACT, STOP, RESET, STATUS, PING, GPIO2(HIGH/LOW/READ), GPIO4(HIGH/LOW/READ)"
 
 // Hardware
-#define PIN_CONFIG            "RELAY_EXTEND=16, RELAY_RETRACT=17, LED=25, AUX_GPIO2=2, AUX_GPIO4=4"
+#define PIN_CONFIG            "RELAY_EXTEND=18, RELAY_RETRACT=8, LED=disabled, AUX_GPIO2=2, AUX_GPIO4=4"
 #define COMPONENTS            "2x relay (pulse-based extend/retract with interlock), status LED, 2x aux GPIO"
 #define KNOWN_QUIRKS          "Pulse timing must be tuned (PULSE_MS). Commands must not be retained. PubSubClient topic pointer can be unreliable, so topic is copied to a local buffer first in mqttCallback."
 

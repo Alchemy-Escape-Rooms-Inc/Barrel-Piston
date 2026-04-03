@@ -36,8 +36,8 @@ const char* T_GPIO2_STATE = "MermaidsTale/BarrelPiston/GPIO2/State";
 const char* T_GPIO4_STATE = "MermaidsTale/BarrelPiston/GPIO4/State";
 
 // Pins (ESP32-S3 compatible)
-const int RELAY_EXTEND_PIN  = 2;
-const int RELAY_RETRACT_PIN = 4;
+const int RELAY_EXTEND_PIN  = 18;
+const int RELAY_RETRACT_PIN = 8;
 const int LED_PIN           = -1;  // Disabled for ESP32-S3
 
 // Timing
