@@ -5,7 +5,7 @@
 // IDENTITY / VERSION
 // =====================================================
 #define DEVICE_NAME "BarrelPiston"
-#define FW_VERSION  "BarrelPiston v2.0.1-S3 (Pulse Mode)"
+#define FW_VERSION  "2.1.0"
 
 // =====================================================
 // CONFIG
@@ -18,22 +18,10 @@ const uint16_t mqtt_port = 1883;
 const char* mqtt_user    = "";
 const char* mqtt_pass    = "";
 
-// MQTT Topics
+// MQTT Topics (WatchTower standard: command, status, log)
 const char* T_COMMAND    = "MermaidsTale/BarrelPiston/command";
 const char* T_STATUS     = "MermaidsTale/BarrelPiston/status";
-const char* T_STATE      = "MermaidsTale/BarrelPiston/state";
-const char* T_SAFETY     = "MermaidsTale/BarrelPiston/safety";
-const char* T_INFO       = "MermaidsTale/BarrelPiston/info";
-const char* T_LASTERROR  = "MermaidsTale/BarrelPiston/lastError";
-const char* T_UPTIME     = "MermaidsTale/BarrelPiston/uptime";
-const char* T_VERSION    = "MermaidsTale/BarrelPiston/version";
-const char* T_DEVICE     = "MermaidsTale/BarrelPiston/device";
-
-// Optional GPIO topics
-const char* T_GPIO2_CMD   = "MermaidsTale/BarrelPiston/GPIO2";
-const char* T_GPIO4_CMD   = "MermaidsTale/BarrelPiston/GPIO4";
-const char* T_GPIO2_STATE = "MermaidsTale/BarrelPiston/GPIO2/State";
-const char* T_GPIO4_STATE = "MermaidsTale/BarrelPiston/GPIO4/State";
+const char* T_LOG        = "MermaidsTale/BarrelPiston/log";
 
 // Pins (ESP32-S3 compatible)
 const int RELAY_EXTEND_PIN  = 18;
@@ -41,11 +29,11 @@ const int RELAY_RETRACT_PIN = 8;
 const int LED_PIN           = -1;  // Disabled for ESP32-S3
 
 // Timing
-const uint32_t PULSE_MS             = 350;      // Adjust if needed for your valve
-const uint32_t INTERLOCK_GAP_MS     = 120;      // Dead time between directions
-const uint32_t STATUS_INTERVAL_MS   = 30000;    // Heartbeat/status publish interval
-const uint32_t WATCHDOG_REBOOT_MS   = 600000;   // Reboot after 10 min inactivity
-const uint32_t BACKOFF_MAX_MS       = 30000;    // Max reconnect backoff
+const uint32_t PULSE_MS             = 350;
+const uint32_t INTERLOCK_GAP_MS     = 120;
+const uint32_t HEARTBEAT_INTERVAL_MS = 300000;   // 5 minutes per WatchTower protocol
+const uint32_t WATCHDOG_REBOOT_MS   = 600000;    // Reboot after 10 min inactivity
+const uint32_t BACKOFF_MAX_MS       = 30000;
 
 // =====================================================
 // GLOBALS
@@ -73,13 +61,10 @@ PendingAction pendingAction = PendingAction::NONE;
 bool safety_latched = false;
 bool relay_extend_intended = false;
 bool relay_retract_intended = false;
-bool gpio2_output = false;
-bool gpio4_output = false;
-
 uint32_t pulse_start_ms = 0;
 uint32_t interlock_start_ms = 0;
 uint32_t last_activity_ms = 0;
-uint32_t last_status_publish_ms = 0;
+uint32_t last_heartbeat_ms = 0;
 uint32_t next_wifi_retry_ms = 0;
 uint32_t next_mqtt_retry_ms = 0;
 uint32_t wifi_backoff_ms = 1000;
@@ -126,24 +111,31 @@ bool mqttReady() {
   return mqtt.connected();
 }
 
-void publishRetained(const char* topic, const char* payload) {
-  if (mqttReady()) mqtt.publish(topic, payload, true);
+void publishStatus(const char* payload) {
+  if (mqttReady()) mqtt.publish(T_STATUS, payload, true);
 }
 
-void publishLive(const char* topic, const char* payload) {
-  if (mqttReady()) mqtt.publish(topic, payload, false);
+void publishLog(const char* payload) {
+  if (mqttReady()) mqtt.publish(T_LOG, payload, false);
+}
+
+void mqttLog(const char* msg) {
+  Serial.println(msg);
+  publishLog(msg);
+}
+
+void mqttLogf(const char* fmt, ...) {
+  char buf[256];
+  va_list args;
+  va_start(args, fmt);
+  vsnprintf(buf, sizeof(buf), fmt, args);
+  va_end(args);
+  Serial.println(buf);
+  publishLog(buf);
 }
 
 bool tokenEquals(const char* a, const char* b) {
   return strcasecmp(a, b) == 0;
-}
-
-bool parseTruth(const char* s) {
-  return tokenEquals(s, "1") || tokenEquals(s, "TRUE") || tokenEquals(s, "ON") || tokenEquals(s, "HIGH");
-}
-
-bool parseFalse(const char* s) {
-  return tokenEquals(s, "0") || tokenEquals(s, "FALSE") || tokenEquals(s, "OFF") || tokenEquals(s, "LOW");
 }
 
 const char* stateToString(PistonState s) {
@@ -169,7 +161,6 @@ const char* pendingToString(PendingAction a) {
 void setLastError(const char* msg) {
   strncpy(last_error, msg, sizeof(last_error) - 1);
   last_error[sizeof(last_error) - 1] = '\0';
-  publishRetained(T_LASTERROR, last_error);
 }
 
 void setRelays(bool extend_on, bool retract_on) {
@@ -185,63 +176,36 @@ void allRelaysOff() {
   setRelays(false, false);
 }
 
-void publishFullStatus() {
-  char info[256];
-  char uptime[32];
+// =====================================================
+// HEARTBEAT & STATUS (WatchTower protocol)
+// =====================================================
+void publishHeartbeat() {
+  char buf[128];
+  snprintf(buf, sizeof(buf), "HEARTBEAT:%s:UP%lus:RSSI%d",
+    stateToString(state),
+    millis() / 1000UL,
+    WiFi.RSSI()
+  );
+  publishStatus(buf);
+}
 
-  snprintf(uptime, sizeof(uptime), "%lu", millis() / 1000UL);
-
-  publishRetained(T_DEVICE, DEVICE_NAME);
-  publishRetained(T_VERSION, FW_VERSION);
-  publishRetained(T_STATUS, mqtt.connected() ? "ONLINE" : "OFFLINE");
-  publishRetained(T_STATE, stateToString(state));
-  publishRetained(T_SAFETY, safety_latched ? "LATCHED" : "CLEAR");
-  publishRetained(T_LASTERROR, last_error);
-  publishRetained(T_UPTIME, uptime);
-
-  snprintf(
-    info,
-    sizeof(info),
-    "%s | Device=%s | IP=%s | State=%s | Safety=%s | Pending=%s | ExtendRelay=%s | RetractRelay=%s | RSSI=%d",
-    FW_VERSION,
+void publishDiagnostics() {
+  char buf[256];
+  snprintf(buf, sizeof(buf),
+    "STATUS:%s|v%s|IP=%s|State=%s|Safety=%s|Pending=%s|Extend=%s|Retract=%s|Err=%s|UP%lus|RSSI%d",
     DEVICE_NAME,
+    FW_VERSION,
     WiFi.localIP().toString().c_str(),
     stateToString(state),
     safety_latched ? "LATCHED" : "CLEAR",
     pendingToString(pendingAction),
     relay_extend_intended ? "ON" : "OFF",
     relay_retract_intended ? "ON" : "OFF",
+    last_error,
+    millis() / 1000UL,
     WiFi.RSSI()
   );
-  publishRetained(T_INFO, info);
-}
-
-void publishGpioState(uint8_t pin, const char* topicState) {
-  int v = digitalRead(pin);
-  publishRetained(topicState, v ? "HIGH" : "LOW");
-}
-
-void handleGpioCmd(uint8_t pin, bool& promoted, const char* topicState, const char* payload) {
-  if (tokenEquals(payload, "READ")) {
-    publishGpioState(pin, topicState);
-    return;
-  }
-
-  if (!promoted) {
-    pinMode(pin, OUTPUT);
-    promoted = true;
-  }
-
-  if (parseTruth(payload)) {
-    digitalWrite(pin, HIGH);
-  } else if (parseFalse(payload)) {
-    digitalWrite(pin, LOW);
-  } else {
-    return;
-  }
-
-  publishGpioState(pin, topicState);
-  last_activity_ms = millis();
+  publishStatus(buf);
 }
 
 // =====================================================
@@ -256,9 +220,8 @@ void setIdle(const char* reason) {
     setLastError(reason);
   }
 
-  publishRetained(T_STATE, "IDLE");
-  publishRetained(T_SAFETY, safety_latched ? "LATCHED" : "CLEAR");
-  Serial.printf("IDLE: %s\n", reason);
+  publishStatus(stateToString(state));
+  mqttLogf("IDLE: %s", reason);
 }
 
 void enterSafety(const char* reason) {
@@ -268,11 +231,10 @@ void enterSafety(const char* reason) {
   safety_latched = true;
 
   setLastError(reason);
-  publishRetained(T_STATE, "SAFETY");
-  publishRetained(T_SAFETY, "LATCHED");
+  publishStatus("SAFETY");
   led.set(80);
 
-  Serial.printf("SAFETY: %s\n", reason);
+  mqttLogf("SAFETY: %s", reason);
 }
 
 void beginInterlock(PendingAction nextAction, const char* reason) {
@@ -282,8 +244,8 @@ void beginInterlock(PendingAction nextAction, const char* reason) {
   interlock_start_ms = millis();
 
   setLastError(reason);
-  publishRetained(T_STATE, "INTERLOCK");
-  Serial.printf("INTERLOCK -> %s (%s)\n", pendingToString(nextAction), reason);
+  publishStatus("INTERLOCK");
+  mqttLogf("INTERLOCK -> %s (%s)", pendingToString(nextAction), reason);
 }
 
 void startPulseExtend() {
@@ -299,9 +261,8 @@ void startPulseExtend() {
   pulse_start_ms = millis();
 
   setLastError("NONE");
-  publishRetained(T_STATE, "PULSE_EXTEND");
-  publishRetained(T_SAFETY, "CLEAR");
-  Serial.println("Pulse: EXTEND");
+  publishStatus("PULSE_EXTEND");
+  mqttLog("Pulse: EXTEND");
 }
 
 void startPulseRetract() {
@@ -317,9 +278,8 @@ void startPulseRetract() {
   pulse_start_ms = millis();
 
   setLastError("NONE");
-  publishRetained(T_STATE, "PULSE_RETRACT");
-  publishRetained(T_SAFETY, "CLEAR");
-  Serial.println("Pulse: RETRACT");
+  publishStatus("PULSE_RETRACT");
+  mqttLog("Pulse: RETRACT");
 }
 
 void processMotionState() {
@@ -328,9 +288,14 @@ void processMotionState() {
   if (state == PistonState::PULSE_EXTEND || state == PistonState::PULSE_RETRACT) {
     if (now - pulse_start_ms >= PULSE_MS) {
       allRelaysOff();
-      state = PistonState::IDLE;
-      publishRetained(T_STATE, "IDLE");
-      Serial.println("Pulse complete -> IDLE");
+
+      if (pendingAction == PendingAction::EXTEND || pendingAction == PendingAction::RETRACT) {
+        beginInterlock(pendingAction, "QUEUED_DIRECTION_SWAP");
+      } else {
+        state = PistonState::IDLE;
+        publishStatus("IDLE");
+        mqttLog("Pulse complete -> IDLE");
+      }
     }
   }
 
@@ -355,29 +320,37 @@ void processMotionState() {
 // =====================================================
 void handlePrimaryCommand(const char* msg) {
   last_activity_ms = millis();
-  Serial.printf("COMMAND: %s\n", msg);
+  mqttLogf("COMMAND: %s", msg);
 
   if (tokenEquals(msg, "PING")) {
-    publishLive(T_INFO, "PONG");
+    publishStatus("PONG");
     return;
   }
 
   if (tokenEquals(msg, "STATUS")) {
-    publishFullStatus();
+    publishDiagnostics();
     return;
   }
 
   if (tokenEquals(msg, "RESET")) {
+    allRelaysOff();
+    publishStatus("OK");
+    mqttLog("RESET: rebooting...");
+    delay(100);
+    ESP.restart();
+    return;
+  }
+
+  if (tokenEquals(msg, "PUZZLE_RESET")) {
     safety_latched = false;
     allRelaysOff();
     state = PistonState::IDLE;
     pendingAction = PendingAction::NONE;
     setLastError("NONE");
-    publishRetained(T_SAFETY, "CLEAR");
-    publishRetained(T_STATE, "IDLE");
-    publishFullStatus();
+    publishStatus("OK");
+    publishDiagnostics();
     led.solid(true);
-    Serial.println("Manual reset complete");
+    mqttLog("PUZZLE_RESET: game state cleared");
     return;
   }
 
@@ -385,8 +358,8 @@ void handlePrimaryCommand(const char* msg) {
     allRelaysOff();
     state = PistonState::IDLE;
     pendingAction = PendingAction::NONE;
-    publishRetained(T_STATE, "IDLE");
-    Serial.println("STOP -> IDLE");
+    publishStatus("IDLE");
+    mqttLog("STOP -> IDLE");
     return;
   }
 
@@ -423,22 +396,12 @@ void handlePrimaryCommand(const char* msg) {
   }
 
   setLastError("UNKNOWN_COMMAND");
-  publishLive(T_INFO, "ERROR: UNKNOWN_COMMAND");
+  mqttLogf("ERROR: UNKNOWN_COMMAND '%s'", msg);
 }
 
 void handleCommand(const char* topic, const char* msg) {
   if (!strcmp(topic, T_COMMAND)) {
     handlePrimaryCommand(msg);
-    return;
-  }
-
-  if (!strcmp(topic, T_GPIO2_CMD)) {
-    handleGpioCmd(2, gpio2_output, T_GPIO2_STATE, msg);
-    return;
-  }
-
-  if (!strcmp(topic, T_GPIO4_CMD)) {
-    handleGpioCmd(4, gpio4_output, T_GPIO4_STATE, msg);
     return;
   }
 }
@@ -486,25 +449,9 @@ void mqttConnectIfNeeded() {
     mqtt_backoff_ms = 1000;
 
     mqtt.subscribe(T_COMMAND);
-    mqtt.subscribe(T_GPIO2_CMD);
-    mqtt.subscribe(T_GPIO4_CMD);
 
-    publishRetained(T_DEVICE, DEVICE_NAME);
-    publishRetained(T_VERSION, FW_VERSION);
-    publishRetained(T_STATUS, "ONLINE");
-    publishRetained(T_STATE, stateToString(state));
-    publishRetained(T_SAFETY, safety_latched ? "LATCHED" : "CLEAR");
-    publishRetained(T_LASTERROR, last_error);
-
-    char info[128];
-    snprintf(info, sizeof(info), "%s Ready - IP: %s", DEVICE_NAME, WiFi.localIP().toString().c_str());
-    publishRetained(T_INFO, info);
-
-    // GPIO 2 and 4 are used for relays, not aux GPIO
-    // publishGpioState(2, T_GPIO2_STATE);
-    // publishGpioState(4, T_GPIO4_STATE);
-
-    publishFullStatus();
+    publishStatus("ONLINE");
+    publishDiagnostics();
     led.solid(true);
   } else {
     int rc = mqtt.state();
@@ -574,8 +521,6 @@ void setup() {
   pinMode(RELAY_RETRACT_PIN, OUTPUT);
   allRelaysOff();
 
-  // GPIO 2 and 4 are used for relays, not aux GPIO
-
   setLastError("NONE");
 
   WiFi.onEvent(onArduinoEvent);
@@ -598,7 +543,7 @@ void loop() {
     mqtt.loop();
   }
 
-  // Impossible output state check
+  // Defensive: should never happen through normal code paths (setRelays is atomic)
   if (relay_extend_intended && relay_retract_intended) {
     enterSafety("HARDWARE_BOTH_RELAYS_ACTIVE");
   }
@@ -607,13 +552,14 @@ void loop() {
 
   uint32_t now = millis();
 
-  if (mqtt.connected() && (now - last_status_publish_ms >= STATUS_INTERVAL_MS)) {
-    publishFullStatus();
-    last_status_publish_ms = now;
+  if (mqtt.connected() && (now - last_heartbeat_ms >= HEARTBEAT_INTERVAL_MS)) {
+    publishHeartbeat();
+    last_heartbeat_ms = now;
   }
 
   if (last_activity_ms > 0 && (now - last_activity_ms > WATCHDOG_REBOOT_MS)) {
-    Serial.println("Watchdog: restarting...");
+    mqttLog("Watchdog: restarting...");
+    delay(100);
     ESP.restart();
   }
 

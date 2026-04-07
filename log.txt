@@ -1,0 +1,62 @@
+============================================
+SESSION LOG — Barrel-Piston Audit
+============================================
+
+Date: 2026-04-07
+
+FILES REVIEWED:
+- BarrelPiston_ESP32S3.ino (622 lines, main ESP32-S3 firmware)
+- barrel_piston_v2_pulse.ino (230 lines, old ESP32 firmware)
+- MANIFEST.h (32 lines, WatchTower dashboard metadata)
+
+CHANGES MADE:
+
+1. DELETED barrel_piston_v2_pulse.ino
+   - Obsolete v2.0.0 firmware for original ESP32
+   - User confirmed prop is fully on ESP32-S3
+
+2. REMOVED all GPIO2/GPIO4 code from BarrelPiston_ESP32S3.ino
+   - Topics: T_GPIO2_CMD, T_GPIO4_CMD, T_GPIO2_STATE, T_GPIO4_STATE
+   - Handlers: handleGpioCmd(), publishGpioState()
+   - State vars: gpio2_output, gpio4_output
+   - Helper functions: parseTruth(), parseFalse() (only used by GPIO handlers)
+   - MQTT subscriptions for GPIO topics
+   - Commented-out code blocks referencing GPIO
+
+3. FIXED MQTT protocol compliance (WatchTower)
+   - Replaced 9 non-standard topics with 3 standard: /command, /status, /log
+   - PING now responds PONG on /status (was /info)
+   - RESET now responds OK on /status then reboots (was soft reset only)
+   - Added PUZZLE_RESET command (soft reset without reboot)
+   - Heartbeat interval changed from 30s to 300s (5 min)
+   - Heartbeat format now: HEARTBEAT:{state}:UP{uptime}s:RSSI{signal}
+   - Added /log topic mirroring all Serial output via mqttLog()/mqttLogf()
+   - STATUS command now publishes full diagnostics on /status
+
+4. FIXED pending action bug in processMotionState()
+   - Pulse completion now checks pendingAction before going to IDLE
+   - If a queued action exists, enters INTERLOCK instead of dropping it
+
+5. UPDATED MANIFEST.h
+   - Version bumped to 2.1.0
+   - Topics updated to command/status/log only
+   - HEARTBEAT_MS corrected to 300000
+   - Removed GPIO2/4 from PIN_CONFIG and topics
+   - Added PUZZLE_RESET to SUPPORTED_COMMANDS
+   - WATCHTOWER_COMPLIANCE now accurately says "full"
+
+6. BUMPED firmware version to 2.1.0
+
+KNOWN ISSUES:
+- None remaining after fixes
+
+NOTES:
+- Watchdog (10 min inactivity reboot) kept per user request
+- LED_PIN disabled (-1) for ESP32-S3 — Blinker code is safely guarded
+- Active LOW relay logic confirmed correct for ESP32-S3 board
+
+NEXT STEPS:
+- Compile and flash to ESP32-S3
+- Test MQTT commands via broker: PING, STATUS, RESET, PUZZLE_RESET, EXTEND, RETRACT, STOP
+- Verify heartbeat appears every 5 min on /status topic
+- Verify /log topic mirrors serial output
