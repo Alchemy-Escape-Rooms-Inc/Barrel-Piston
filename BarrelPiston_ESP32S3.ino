@@ -1,283 +1,382 @@
 #include <WiFi.h>
 #include <PubSubClient.h>
 
-// ===========================
+// =====================================================
+// IDENTITY / VERSION
+// =====================================================
+#define DEVICE_NAME "BarrelPiston"
+#define FW_VERSION  "BarrelPiston v3.0.0-S3 (Continuous Mode)"
+
+// =====================================================
 // CONFIG
-// ===========================
-const char* ssid       = "AlchemyGuest";
-const char* password   = "VoodooVacation5601";
+// =====================================================
+const char* ssid         = "AlchemyGuest";
+const char* password     = "VoodooVacation5601";
 
-const char* mqtt_host  = "10.1.10.115";
+const char* mqtt_host    = "10.1.10.115";
 const uint16_t mqtt_port = 1883;
-const char* mqtt_user  = "";
-const char* mqtt_pass  = "";
+const char* mqtt_user    = "";
+const char* mqtt_pass    = "";
 
-// Topics
-const char* T_EXTEND      = "MermaidsTale/BarrelPiston/Extend";
-const char* T_RETRACT     = "MermaidsTale/BarrelPiston/Retract";
-const char* T_STATUS      = "MermaidsTale/BarrelPiston/Status";
-const char* T_SAFETY      = "MermaidsTale/BarrelPiston/Safety";
-const char* T_INFO        = "MermaidsTale/BarrelPiston/DeviceInfo";
+// MQTT Topics
+const char* T_COMMAND    = "MermaidsTale/BarrelPiston/command";
+const char* T_STATUS     = "MermaidsTale/BarrelPiston/status";
+const char* T_STATE      = "MermaidsTale/BarrelPiston/state";
+const char* T_SAFETY     = "MermaidsTale/BarrelPiston/safety";
+const char* T_INFO       = "MermaidsTale/BarrelPiston/info";
+const char* T_LASTERROR  = "MermaidsTale/BarrelPiston/lastError";
+const char* T_UPTIME     = "MermaidsTale/BarrelPiston/uptime";
+const char* T_VERSION    = "MermaidsTale/BarrelPiston/version";
+const char* T_DEVICE     = "MermaidsTale/BarrelPiston/device";
 
-// GPIO2/4 control topics (+ state echoes)
+// GPIO control topics
 const char* T_GPIO2_CMD   = "MermaidsTale/BarrelPiston/GPIO2";
 const char* T_GPIO4_CMD   = "MermaidsTale/BarrelPiston/GPIO4";
 const char* T_GPIO2_STATE = "MermaidsTale/BarrelPiston/GPIO2/State";
 const char* T_GPIO4_STATE = "MermaidsTale/BarrelPiston/GPIO4/State";
 
 // Pins (ESP32-S3)
-const int RELAY_EXTEND_PIN  = 18;    // GPIO18
-const int RELAY_RETRACT_PIN = 8;     // GPIO8
-const int LED_PIN           = -1;    // Disabled for ESP32-S3
+const int RELAY_EXTEND_PIN  = 18;
+const int RELAY_RETRACT_PIN = 8;
+const int LED_PIN           = -1;  // Disabled for ESP32-S3
 
 // Timing
-const uint32_t CMD_TIMEOUT_MS      = 120000;   // auto-stop and clear all statuses after 2 min
-const uint32_t WATCHDOG_REBOOT_MS  = 600000;   // reboot after 10 min inactivity
-const uint32_t INTERLOCK_GAP_MS    = 120;      // gap when swapping direction
-const uint32_t BACKOFF_MAX_MS      = 30000;
+const uint32_t INTERLOCK_GAP_MS     = 120;      // Dead time between direction changes
+const uint32_t STATUS_INTERVAL_MS   = 30000;    // Heartbeat/status publish interval
+const uint32_t CMD_TIMEOUT_MS       = 120000;   // Auto-stop after 2 min of no commands
+const uint32_t WATCHDOG_REBOOT_MS   = 600000;   // Reboot after 10 min inactivity
+const uint32_t BACKOFF_MAX_MS       = 30000;    // Max reconnect backoff
 
-// ===========================
+// =====================================================
 // GLOBALS
-// ===========================
+// =====================================================
 WiFiClient wifi;
 PubSubClient mqtt(wifi);
 
-enum class PistonState : uint8_t { STOPPED, EXTENDING, RETRACTING, SAFETY };
+enum class PistonState : uint8_t {
+  STOPPED,
+  EXTENDING,
+  RETRACTING,
+  SAFETY
+};
+
 PistonState state = PistonState::STOPPED;
 
 bool safety_latched = false;
-uint32_t last_cmd_ms = 0;
-uint32_t last_activity_ms = 0;
-
-// Track what the controller WANTS to do (not what MQTT sends)
-bool want_extend = false;
-bool want_retract = false;
-
-// Track whether we've promoted GPIO2/4 to OUTPUT yet
+bool relay_extend_intended = false;
+bool relay_retract_intended = false;
 bool gpio2_output = false;
 bool gpio4_output = false;
 
-// Track the actual intended relay states (more reliable than digitalRead on OUTPUT pins)
-bool relay_extend_intended = false;
-bool relay_retract_intended = false;
+uint32_t last_cmd_ms = 0;
+uint32_t last_activity_ms = 0;
+uint32_t last_status_publish_ms = 0;
+uint32_t next_wifi_retry_ms = 0;
+uint32_t next_mqtt_retry_ms = 0;
+uint32_t wifi_backoff_ms = 1000;
+uint32_t mqtt_backoff_ms = 1000;
 
-// LED blinker (non-blocking)
+char last_error[96] = "NONE";
+
+// =====================================================
+// LED BLINKER (disabled when LED_PIN < 0)
+// =====================================================
 struct Blinker {
-  uint32_t interval_ms = 0, last_ms = 0;
+  uint32_t interval_ms = 0;
+  uint32_t last_ms = 0;
   bool level = false;
-  void set(uint32_t ms){
+
+  void set(uint32_t ms) {
     if (LED_PIN < 0) return;
-    interval_ms = ms; last_ms = millis();
+    interval_ms = ms;
+    last_ms = millis();
   }
-  void tick(){
+
+  void tick() {
     if (LED_PIN < 0 || !interval_ms) return;
-    uint32_t now=millis();
-    if(now-last_ms>=interval_ms){ last_ms=now; level=!level; digitalWrite(LED_PIN, level); }
+    uint32_t now = millis();
+    if (now - last_ms >= interval_ms) {
+      last_ms = now;
+      level = !level;
+      digitalWrite(LED_PIN, level);
+    }
   }
-  void solid(bool on){
+
+  void solid(bool on) {
     if (LED_PIN < 0) return;
-    interval_ms=0; digitalWrite(LED_PIN,on); level=on;
+    interval_ms = 0;
+    level = on;
+    digitalWrite(LED_PIN, on);
   }
 } led;
 
-uint32_t next_wifi_retry_ms = 0, next_mqtt_retry_ms = 0;
-uint32_t wifi_backoff_ms = 1000, mqtt_backoff_ms = 1000;
+// =====================================================
+// HELPERS
+// =====================================================
+bool mqttReady() {
+  return mqtt.connected();
+}
 
-// ===========================
-// UTIL
-// ===========================
+void publishRetained(const char* topic, const char* payload) {
+  if (mqttReady()) mqtt.publish(topic, payload, true);
+}
+
+void publishLive(const char* topic, const char* payload) {
+  if (mqttReady()) mqtt.publish(topic, payload, false);
+}
+
+bool tokenEquals(const char* a, const char* b) {
+  return strcasecmp(a, b) == 0;
+}
+
+bool parseTruth(const char* s) {
+  return tokenEquals(s, "1") || tokenEquals(s, "TRUE") || tokenEquals(s, "ON") || tokenEquals(s, "HIGH");
+}
+
+bool parseFalse(const char* s) {
+  return tokenEquals(s, "0") || tokenEquals(s, "FALSE") || tokenEquals(s, "OFF") || tokenEquals(s, "LOW");
+}
+
+const char* stateToString(PistonState s) {
+  switch (s) {
+    case PistonState::STOPPED:    return "STOPPED";
+    case PistonState::EXTENDING:  return "EXTENDING";
+    case PistonState::RETRACTING: return "RETRACTING";
+    case PistonState::SAFETY:     return "SAFETY";
+    default:                      return "UNKNOWN";
+  }
+}
+
+void setLastError(const char* msg) {
+  strncpy(last_error, msg, sizeof(last_error) - 1);
+  last_error[sizeof(last_error) - 1] = '\0';
+  publishRetained(T_LASTERROR, last_error);
+}
+
 void setRelays(bool extend_on, bool retract_on) {
-  // Active HIGH relays - HIGH = ON, LOW = OFF
-  digitalWrite(RELAY_EXTEND_PIN, extend_on ? HIGH : LOW);
-  digitalWrite(RELAY_RETRACT_PIN, retract_on ? HIGH : LOW);
-  relay_extend_intended = extend_on;
+  // Active LOW relays - LOW = ON, HIGH = OFF
+  digitalWrite(RELAY_EXTEND_PIN,  extend_on  ? LOW : HIGH);
+  digitalWrite(RELAY_RETRACT_PIN, retract_on ? LOW : HIGH);
+
+  relay_extend_intended  = extend_on;
   relay_retract_intended = retract_on;
 }
 
-void publishStatus(const char* s, bool retained=false){ mqtt.publish(T_STATUS, s, retained); }
-void publishSafety(const char* s, bool retained=false){ mqtt.publish(T_SAFETY, s, retained); }
-
-void toStopped(const char* reason=nullptr) {
-  state = PistonState::STOPPED;
-  safety_latched = false;
-  want_extend = false;
-  want_retract = false;
+void allRelaysOff() {
   setRelays(false, false);
-  // Clear ALL MQTT statuses so nothing stays stale
-  publishStatus("STOPPED");
-  mqtt.publish(T_EXTEND, "0", true);
-  mqtt.publish(T_RETRACT, "0", true);
-  if (reason) publishSafety(reason);
-  publishSafety("CLEAR", true);
-  Serial.printf("State: STOPPED (%s)\n", reason ? reason : "manual");
 }
 
-void toExtending() {
-  // Safety: ensure retract is off first
-  setRelays(false, false);
-  delay(INTERLOCK_GAP_MS);
+void publishFullStatus() {
+  char info[256];
+  char uptime[32];
 
-  setRelays(true, false);
-  safety_latched = false;
-  state = PistonState::EXTENDING;
-  publishStatus("EXTENDING");
-  Serial.println("State: EXTENDING");
+  snprintf(uptime, sizeof(uptime), "%lu", millis() / 1000UL);
+
+  publishRetained(T_DEVICE, DEVICE_NAME);
+  publishRetained(T_VERSION, FW_VERSION);
+  publishRetained(T_STATUS, mqtt.connected() ? "ONLINE" : "OFFLINE");
+  publishRetained(T_STATE, stateToString(state));
+  publishRetained(T_SAFETY, safety_latched ? "LATCHED" : "CLEAR");
+  publishRetained(T_LASTERROR, last_error);
+  publishRetained(T_UPTIME, uptime);
+
+  snprintf(
+    info,
+    sizeof(info),
+    "%s | Device=%s | IP=%s | State=%s | Safety=%s | ExtendRelay=%s | RetractRelay=%s | RSSI=%d",
+    FW_VERSION,
+    DEVICE_NAME,
+    WiFi.localIP().toString().c_str(),
+    stateToString(state),
+    safety_latched ? "LATCHED" : "CLEAR",
+    relay_extend_intended ? "ON" : "OFF",
+    relay_retract_intended ? "ON" : "OFF",
+    WiFi.RSSI()
+  );
+  publishRetained(T_INFO, info);
 }
 
-void toRetracting(){
-  // Safety: ensure extend is off first
-  setRelays(false, false);
-  delay(INTERLOCK_GAP_MS);
-
-  setRelays(false, true);
-  safety_latched = false;
-  state = PistonState::RETRACTING;
-  publishStatus("RETRACTING");
-  Serial.println("State: RETRACTING");
-}
-
-void safetyShutdown(const char* why) {
-  if(!safety_latched){
-    safety_latched=true;
-    publishSafety("EMERGENCY_STOP");
-    publishStatus("SAFETY_SHUTDOWN");
-  }
-  setRelays(false,false);
-  state=PistonState::SAFETY;
-  want_extend = false;
-  want_retract = false;
-  // Clear retained command topics so stale "1" doesn't re-trigger after reboot
-  mqtt.publish(T_EXTEND, "0", true);
-  mqtt.publish(T_RETRACT, "0", true);
-  led.set(80); // fast blink
-  publishSafety(why);
-  Serial.printf("SAFETY SHUTDOWN: %s\n", why);
-}
-
-bool parseTruth(const char* s){
-  return (!strcasecmp(s,"1")||!strcasecmp(s,"true")||!strcasecmp(s,"on")||!strcasecmp(s,"high"));
-}
-bool parseFalse(const char* s){
-  return (!strcasecmp(s,"0")||!strcasecmp(s,"false")||!strcasecmp(s,"off")||!strcasecmp(s,"low"));
-}
-
-void publishGpioState(uint8_t pin, const char* topicState){
+void publishGpioState(uint8_t pin, const char* topicState) {
   int v = digitalRead(pin);
-  mqtt.publish(topicState, v ? "HIGH" : "LOW", true);
+  publishRetained(topicState, v ? "HIGH" : "LOW");
 }
 
-void handleGpioCmd(uint8_t pin, bool& promoted, const char* topicState, const char* payload){
-  if (!strcasecmp(payload, "READ")) {
+void handleGpioCmd(uint8_t pin, bool& promoted, const char* topicState, const char* payload) {
+  if (tokenEquals(payload, "READ")) {
     publishGpioState(pin, topicState);
     return;
   }
+
   if (!promoted) {
-    pinMode(pin, OUTPUT);   // promote to OUTPUT only when commanded
+    pinMode(pin, OUTPUT);
     promoted = true;
   }
+
   if (parseTruth(payload)) {
     digitalWrite(pin, HIGH);
   } else if (parseFalse(payload)) {
     digitalWrite(pin, LOW);
   } else {
-    // ignore unknown tokens
     return;
   }
+
   publishGpioState(pin, topicState);
-  last_cmd_ms = last_activity_ms = millis();
+  last_activity_ms = millis();
 }
 
-// Process the desired state and handle mutual exclusion
-void processDesiredState() {
-  // Safety: never allow both to be true
-  if (want_extend && want_retract) {
-    safetyShutdown("BOTH_COMMANDS_ACTIVE");
+// =====================================================
+// STATE CONTROL (Continuous Mode - stays until changed)
+// =====================================================
+void toStopped(const char* reason) {
+  allRelaysOff();
+  state = PistonState::STOPPED;
+
+  if (reason && !tokenEquals(reason, "NONE")) {
+    setLastError(reason);
+  }
+
+  publishRetained(T_STATE, "STOPPED");
+  publishRetained(T_SAFETY, safety_latched ? "LATCHED" : "CLEAR");
+  Serial.printf("STOPPED: %s\n", reason ? reason : "normal");
+}
+
+void enterSafety(const char* reason) {
+  allRelaysOff();
+  state = PistonState::SAFETY;
+  safety_latched = true;
+
+  setLastError(reason);
+  publishRetained(T_STATE, "SAFETY");
+  publishRetained(T_SAFETY, "LATCHED");
+  led.set(80);
+
+  Serial.printf("SAFETY: %s\n", reason);
+}
+
+void startExtend() {
+  if (safety_latched) {
+    enterSafety("EXTEND_BLOCKED_SAFETY_LATCHED");
     return;
   }
 
-  // If in safety mode, only allow clearing (both wants false = reset)
-  if (state == PistonState::SAFETY) {
-    if (!want_extend && !want_retract) {
-      toStopped("SAFETY_CLEARED");
-      Serial.println("Safety mode cleared by operator reset");
-    }
+  // If retracting, stop first with interlock gap
+  if (state == PistonState::RETRACTING) {
+    allRelaysOff();
+    delay(INTERLOCK_GAP_MS);
+  }
+
+  setRelays(true, false);
+  state = PistonState::EXTENDING;
+
+  setLastError("NONE");
+  publishRetained(T_STATE, "EXTENDING");
+  publishRetained(T_SAFETY, "CLEAR");
+  Serial.println("State: EXTENDING (continuous)");
+}
+
+void startRetract() {
+  if (safety_latched) {
+    enterSafety("RETRACT_BLOCKED_SAFETY_LATCHED");
     return;
   }
 
-  // Process the desired action
-  if (want_extend && !want_retract) {
-    if (state != PistonState::EXTENDING) {
-      toExtending();
-    }
+  // If extending, stop first with interlock gap
+  if (state == PistonState::EXTENDING) {
+    allRelaysOff();
+    delay(INTERLOCK_GAP_MS);
   }
-  else if (want_retract && !want_extend) {
-    if (state != PistonState::RETRACTING) {
-      toRetracting();
-    }
+
+  setRelays(false, true);
+  state = PistonState::RETRACTING;
+
+  setLastError("NONE");
+  publishRetained(T_STATE, "RETRACTING");
+  publishRetained(T_SAFETY, "CLEAR");
+  Serial.println("State: RETRACTING (continuous)");
+}
+
+// =====================================================
+// COMMANDS
+// =====================================================
+void handlePrimaryCommand(const char* msg) {
+  last_cmd_ms = millis();
+  last_activity_ms = last_cmd_ms;
+  Serial.printf("COMMAND: %s\n", msg);
+
+  if (tokenEquals(msg, "PING")) {
+    publishLive(T_INFO, "PONG");
+    return;
   }
-  else {
-    // Both false or safety condition - stop
-    if (state == PistonState::EXTENDING || state == PistonState::RETRACTING) {
-      toStopped("COMMAND_CLEARED");
-    }
+
+  if (tokenEquals(msg, "STATUS")) {
+    publishFullStatus();
+    return;
   }
+
+  if (tokenEquals(msg, "RESET")) {
+    safety_latched = false;
+    allRelaysOff();
+    state = PistonState::STOPPED;
+    setLastError("NONE");
+    publishRetained(T_SAFETY, "CLEAR");
+    publishRetained(T_STATE, "STOPPED");
+    publishFullStatus();
+    led.solid(true);
+    Serial.println("Manual reset complete");
+    return;
+  }
+
+  if (tokenEquals(msg, "STOP")) {
+    toStopped("STOP_COMMAND");
+    return;
+  }
+
+  if (tokenEquals(msg, "EXTEND")) {
+    startExtend();
+    return;
+  }
+
+  if (tokenEquals(msg, "RETRACT")) {
+    startRetract();
+    return;
+  }
+
+  setLastError("UNKNOWN_COMMAND");
+  publishLive(T_INFO, "ERROR: UNKNOWN_COMMAND");
 }
 
 void handleCommand(const char* topic, const char* msg) {
-  last_cmd_ms = millis();
-  last_activity_ms = last_cmd_ms;
-
-  Serial.printf("Command received - Topic: %s, Message: %s\n", topic, msg);
-
-  if (!strcmp(topic, T_EXTEND)) {
-    want_extend = parseTruth(msg);
-    Serial.printf("want_extend set to: %s\n", want_extend ? "TRUE" : "FALSE");
-
-    // Read and report current relay pin states
-    bool extend_pin_state = digitalRead(RELAY_EXTEND_PIN);
-    bool retract_pin_state = digitalRead(RELAY_RETRACT_PIN);
-    Serial.printf("Relay pins after EXTEND command - Pin %d: %s, Pin %d: %s\n",
-                  RELAY_EXTEND_PIN, extend_pin_state ? "HIGH" : "LOW",
-                  RELAY_RETRACT_PIN, retract_pin_state ? "HIGH" : "LOW");
-
-  } else if (!strcmp(topic, T_RETRACT)) {
-    want_retract = parseTruth(msg);
-    Serial.printf("want_retract set to: %s\n", want_retract ? "TRUE" : "FALSE");
-
-    // Read and report current relay pin states
-    bool extend_pin_state = digitalRead(RELAY_EXTEND_PIN);
-    bool retract_pin_state = digitalRead(RELAY_RETRACT_PIN);
-    Serial.printf("Relay pins after RETRACT command - Pin %d: %s, Pin %d: %s\n",
-                  RELAY_EXTEND_PIN, extend_pin_state ? "HIGH" : "LOW",
-                  RELAY_RETRACT_PIN, retract_pin_state ? "HIGH" : "LOW");
-
-  } else if (!strcmp(topic, T_GPIO2_CMD)) {
-    handleGpioCmd(/*pin*/2, gpio2_output, T_GPIO2_STATE, msg);
-    return; // Don't process state for GPIO commands
-
-  } else if (!strcmp(topic, T_GPIO4_CMD)) {
-    handleGpioCmd(/*pin*/4, gpio4_output, T_GPIO4_STATE, msg);
-    return; // Don't process state for GPIO commands
+  if (!strcmp(topic, T_COMMAND)) {
+    handlePrimaryCommand(msg);
+    return;
   }
 
-  // Process the new desired state
-  processDesiredState();
+  if (!strcmp(topic, T_GPIO2_CMD)) {
+    handleGpioCmd(2, gpio2_output, T_GPIO2_STATE, msg);
+    return;
+  }
+
+  if (!strcmp(topic, T_GPIO4_CMD)) {
+    handleGpioCmd(4, gpio4_output, T_GPIO4_STATE, msg);
+    return;
+  }
 }
 
-// ===========================
+// =====================================================
 // MQTT
-// ===========================
+// =====================================================
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
   static char buf[128];
   static char topicBuf[128];
 
-  // Copy topic to local buffer (PubSubClient pointer can be unreliable)
   unsigned int safeTopicLen = min((unsigned int)strlen(topic), (unsigned int)(sizeof(topicBuf) - 1));
   memcpy(topicBuf, topic, safeTopicLen);
   topicBuf[safeTopicLen] = '\0';
 
-  length = min(length, (unsigned int)(sizeof(buf)-1));
-  memcpy(buf, payload, length); buf[length]='\0';
+  length = min(length, (unsigned int)(sizeof(buf) - 1));
+  memcpy(buf, payload, length);
+  buf[length] = '\0';
+
   Serial.printf("MQTT [%s] %s\n", topicBuf, buf);
   handleCommand(topicBuf, buf);
 }
@@ -292,46 +391,48 @@ void mqttConnectIfNeeded() {
   mqtt.setServer(mqtt_host, mqtt_port);
   mqtt.setCallback(mqttCallback);
 
-  // LWT so broker marks us OFFLINE on unexpected drop
-  String cid = String("ESP32S3-Piston-") + String((uint32_t)ESP.getEfuseMac(), HEX);
-  bool ok = (strlen(mqtt_user)==0)
-    ? mqtt.connect(cid.c_str(), T_STATUS, 1, true, "OFFLINE")
-    : mqtt.connect(cid.c_str(), mqtt_user, mqtt_pass, T_STATUS, 1, true, "OFFLINE");
+  String cid = String("ESP32S3-BarrelPiston-") + String((uint32_t)ESP.getEfuseMac(), HEX);
+
+  bool ok;
+  if (strlen(mqtt_user) == 0) {
+    ok = mqtt.connect(cid.c_str(), T_STATUS, 1, true, "OFFLINE");
+  } else {
+    ok = mqtt.connect(cid.c_str(), mqtt_user, mqtt_pass, T_STATUS, 1, true, "OFFLINE");
+  }
 
   if (ok) {
     Serial.println("MQTT: connected");
     mqtt_backoff_ms = 1000;
 
-    mqtt.subscribe(T_EXTEND);
-    mqtt.subscribe(T_RETRACT);
+    mqtt.subscribe(T_COMMAND);
     mqtt.subscribe(T_GPIO2_CMD);
     mqtt.subscribe(T_GPIO4_CMD);
 
-    publishStatus("ONLINE", true);
-    publishSafety("SYSTEM_READY", true);
+    publishRetained(T_DEVICE, DEVICE_NAME);
+    publishRetained(T_VERSION, FW_VERSION);
+    publishRetained(T_STATUS, "ONLINE");
+    publishRetained(T_STATE, stateToString(state));
+    publishRetained(T_SAFETY, safety_latched ? "LATCHED" : "CLEAR");
+    publishRetained(T_LASTERROR, last_error);
 
-    String info = "ESP32-S3 BarrelPiston Ready - IP: " + WiFi.localIP().toString();
-    mqtt.publish(T_INFO, info.c_str(), true);
+    char info[128];
+    snprintf(info, sizeof(info), "%s Ready - IP: %s", DEVICE_NAME, WiFi.localIP().toString().c_str());
+    publishRetained(T_INFO, info);
 
-    // Publish initial GPIO states (INPUT default; only promote on set)
-    pinMode(2, INPUT);
-    pinMode(4, INPUT);
-    publishGpioState(2, T_GPIO2_STATE);
-    publishGpioState(4, T_GPIO4_STATE);
-
-    led.solid(true); // solid when fully online
+    publishFullStatus();
+    led.solid(true);
   } else {
     int rc = mqtt.state();
     Serial.printf("MQTT: failed rc=%d\n", rc);
     next_mqtt_retry_ms = now + mqtt_backoff_ms;
-    mqtt_backoff_ms = min<uint32_t>(mqtt_backoff_ms*2, BACKOFF_MAX_MS);
-    led.set(400); // slow blink while disconnected
+    mqtt_backoff_ms = min<uint32_t>(mqtt_backoff_ms * 2, BACKOFF_MAX_MS);
+    led.set(400);
   }
 }
 
-// ===========================
-// WIFI (ESP32 core 3.3.0 Arduino events)
-// ===========================
+// =====================================================
+// WIFI
+// =====================================================
 void onArduinoEvent(arduino_event_t* event) {
   switch (event->event_id) {
     case ARDUINO_EVENT_WIFI_STA_CONNECTED:
@@ -342,12 +443,12 @@ void onArduinoEvent(arduino_event_t* event) {
       Serial.print("WiFi: IP ");
       Serial.println(WiFi.localIP());
       wifi_backoff_ms = 1000;
-      next_mqtt_retry_ms = 0;   // allow immediate MQTT try
+      next_mqtt_retry_ms = 0;
       break;
 
     case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
       Serial.println("WiFi: disconnected");
-      led.set(250);             // blink while reconnecting
+      led.set(250);
       break;
 
     default:
@@ -362,71 +463,81 @@ void wifiEnsureConnected() {
   if (now < next_wifi_retry_ms) return;
 
   Serial.println("WiFi: (re)connecting...");
-  WiFi.disconnect(true,true);
+  WiFi.disconnect(true, true);
   delay(100);
   WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid,password);
+  WiFi.begin(ssid, password);
 
   next_wifi_retry_ms = now + wifi_backoff_ms;
-  wifi_backoff_ms = min<uint32_t>(wifi_backoff_ms*2, BACKOFF_MAX_MS);
+  wifi_backoff_ms = min<uint32_t>(wifi_backoff_ms * 2, BACKOFF_MAX_MS);
 }
 
-// ===========================
-// SETUP/LOOP
-// ===========================
+// =====================================================
+// SETUP / LOOP
+// =====================================================
 void setup() {
   Serial.begin(115200);
   delay(50);
-  Serial.println("\nStarting ESP32-S3 Barrel Piston Controller (Continuous Mode)...");
+  Serial.println("\n" FW_VERSION);
+  Serial.println("Starting ESP32-S3 Barrel Piston Controller...");
 
   if (LED_PIN >= 0) {
     pinMode(LED_PIN, OUTPUT);
-    led.set(300); // searching blink
+    led.set(300);
   }
 
-  // Relays default off (HIGH = off for active LOW relays)
   pinMode(RELAY_EXTEND_PIN, OUTPUT);
   pinMode(RELAY_RETRACT_PIN, OUTPUT);
-  setRelays(false,false);
+  allRelaysOff();
 
-  // Keep GPIO2/4 INPUT until commanded
-  pinMode(2, INPUT);
-  pinMode(4, INPUT);
+  setLastError("NONE");
 
   WiFi.onEvent(onArduinoEvent);
   WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, password);
 
-  last_cmd_ms = last_activity_ms = millis();
+  last_cmd_ms = millis();
+  last_activity_ms = millis();
 }
 
 void loop() {
   led.tick();
 
   wifiEnsureConnected();
-  if (WiFi.status() == WL_CONNECTED) mqttConnectIfNeeded();
-  if (mqtt.connected()) mqtt.loop();
 
-  // Hardware safety check - use intended states instead of unreliable digitalRead
+  if (WiFi.status() == WL_CONNECTED) {
+    mqttConnectIfNeeded();
+  }
+
+  if (mqtt.connected()) {
+    mqtt.loop();
+  }
+
+  // Safety check - both relays should never be active
   if (relay_extend_intended && relay_retract_intended) {
-    safetyShutdown("HARDWARE_BOTH_ACTIVE");
+    enterSafety("HARDWARE_BOTH_RELAYS_ACTIVE");
   }
 
   uint32_t now = millis();
 
-  // Auto-stop and clear all statuses after timeout (includes SAFETY auto-clear)
-  if ((state == PistonState::EXTENDING || state == PistonState::RETRACTING ||
-       state == PistonState::SAFETY) &&
+  // Auto-stop after command timeout (continuous mode safety)
+  if ((state == PistonState::EXTENDING || state == PistonState::RETRACTING) &&
       (now - last_cmd_ms > CMD_TIMEOUT_MS)) {
-    toStopped("TIMEOUT_STOP");
-    Serial.println("Auto-cleared state after timeout");
+    toStopped("TIMEOUT_AUTO_STOP");
+    Serial.println("Auto-stopped after command timeout");
   }
 
-  // Watchdog: reboot after long inactivity (no commands)
-  if (last_activity_ms>0 && (now - last_activity_ms > WATCHDOG_REBOOT_MS)) {
+  // Periodic status heartbeat
+  if (mqtt.connected() && (now - last_status_publish_ms >= STATUS_INTERVAL_MS)) {
+    publishFullStatus();
+    last_status_publish_ms = now;
+  }
+
+  // Watchdog: reboot after long inactivity
+  if (last_activity_ms > 0 && (now - last_activity_ms > WATCHDOG_REBOOT_MS)) {
     Serial.println("Watchdog: restarting...");
     ESP.restart();
   }
 
-  delay(5); // light cadence
+  delay(5);
 }
