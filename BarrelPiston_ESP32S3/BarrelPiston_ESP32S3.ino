@@ -5,7 +5,7 @@
 // IDENTITY / VERSION
 // =====================================================
 #define DEVICE_NAME "BarrelPiston"
-#define FW_VERSION  "BarrelPiston v3.0.0-S3 (Continuous Mode)"
+#define FW_VERSION  "BarrelPiston v3.1.0-S3 (Continuous Mode)"
 
 // =====================================================
 // CONFIG
@@ -28,6 +28,7 @@ const char* T_LASTERROR  = "MermaidsTale/BarrelPiston/lastError";
 const char* T_UPTIME     = "MermaidsTale/BarrelPiston/uptime";
 const char* T_VERSION    = "MermaidsTale/BarrelPiston/version";
 const char* T_DEVICE     = "MermaidsTale/BarrelPiston/device";
+const char* T_LOG        = "MermaidsTale/BarrelPiston/log";
 
 // GPIO control topics
 const char* T_GPIO2_CMD   = "MermaidsTale/BarrelPiston/GPIO2";
@@ -42,7 +43,7 @@ const int LED_PIN           = -1;  // Disabled for ESP32-S3
 
 // Timing
 const uint32_t INTERLOCK_GAP_MS     = 120;      // Dead time between direction changes
-const uint32_t STATUS_INTERVAL_MS   = 30000;    // Heartbeat/status publish interval
+const uint32_t STATUS_INTERVAL_MS   = 300000;   // Heartbeat publish interval (WatchTower standard: 5 min)
 const uint32_t CMD_TIMEOUT_MS       = 120000;   // Auto-stop after 2 min of no commands
 const uint32_t WATCHDOG_REBOOT_MS   = 600000;   // Reboot after 10 min inactivity
 const uint32_t BACKOFF_MAX_MS       = 30000;    // Max reconnect backoff
@@ -125,6 +126,11 @@ void publishLive(const char* topic, const char* payload) {
   if (mqttReady()) mqtt.publish(topic, payload, false);
 }
 
+void mqttLog(const char* msg) {
+  Serial.println(msg);
+  publishLive(T_LOG, msg);
+}
+
 bool tokenEquals(const char* a, const char* b) {
   return strcasecmp(a, b) == 0;
 }
@@ -196,6 +202,14 @@ void publishFullStatus() {
   publishRetained(T_INFO, info);
 }
 
+void publishHeartbeat() {
+  // WatchTower standard heartbeat: HEARTBEAT:{state}:UP{uptime}s:RSSI{signal} on /status
+  char hb[64];
+  snprintf(hb, sizeof(hb), "HEARTBEAT:%s:UP%lus:RSSI%d",
+           stateToString(state), millis() / 1000UL, WiFi.RSSI());
+  publishLive(T_STATUS, hb);
+}
+
 void publishGpioState(uint8_t pin, const char* topicState) {
   int v = digitalRead(pin);
   publishRetained(topicState, v ? "HIGH" : "LOW");
@@ -237,7 +251,10 @@ void toStopped(const char* reason) {
 
   publishRetained(T_STATE, "STOPPED");
   publishRetained(T_SAFETY, safety_latched ? "LATCHED" : "CLEAR");
-  Serial.printf("STOPPED: %s\n", reason ? reason : "normal");
+
+  char lg[112];
+  snprintf(lg, sizeof(lg), "STOPPED: %s", reason ? reason : "normal");
+  mqttLog(lg);
 }
 
 void enterSafety(const char* reason) {
@@ -250,7 +267,9 @@ void enterSafety(const char* reason) {
   publishRetained(T_SAFETY, "LATCHED");
   led.set(80);
 
-  Serial.printf("SAFETY: %s\n", reason);
+  char lg[112];
+  snprintf(lg, sizeof(lg), "SAFETY: %s", reason);
+  mqttLog(lg);
 }
 
 void startExtend() {
@@ -271,7 +290,7 @@ void startExtend() {
   setLastError("NONE");
   publishRetained(T_STATE, "EXTENDING");
   publishRetained(T_SAFETY, "CLEAR");
-  Serial.println("State: EXTENDING (continuous)");
+  mqttLog("State: EXTENDING (continuous)");
 }
 
 void startRetract() {
@@ -292,19 +311,28 @@ void startRetract() {
   setLastError("NONE");
   publishRetained(T_STATE, "RETRACTING");
   publishRetained(T_SAFETY, "CLEAR");
-  Serial.println("State: RETRACTING (continuous)");
+  mqttLog("State: RETRACTING (continuous)");
 }
 
 // =====================================================
 // COMMANDS
 // =====================================================
 void handlePrimaryCommand(const char* msg) {
+  // Our own PONG/OK replies arrive back on /command (we subscribe to it).
+  // Ignore them silently or they'd register as UNKNOWN_COMMAND.
+  if (tokenEquals(msg, "PONG") || tokenEquals(msg, "OK") || strlen(msg) == 0) {
+    return;
+  }
+
   last_cmd_ms = millis();
   last_activity_ms = last_cmd_ms;
-  Serial.printf("COMMAND: %s\n", msg);
+
+  char lg[64];
+  snprintf(lg, sizeof(lg), "COMMAND: %s", msg);
+  mqttLog(lg);
 
   if (tokenEquals(msg, "PING")) {
-    publishLive(T_INFO, "PONG");
+    publishLive(T_COMMAND, "PONG");  // WatchTower standard: PONG on the topic the command arrived on
     return;
   }
 
@@ -314,15 +342,28 @@ void handlePrimaryCommand(const char* msg) {
   }
 
   if (tokenEquals(msg, "RESET")) {
+    // WatchTower standard: stop actuators, respond OK, then software reboot
+    mqttLog("RESET: rebooting");
+    allRelaysOff();
+    publishLive(T_COMMAND, "OK");
+    mqtt.loop();
+    delay(250);
+    ESP.restart();
+    return;
+  }
+
+  if (tokenEquals(msg, "PUZZLE_RESET")) {
+    // Reset game state without rebooting: clear safety latch, stop, resync
     safety_latched = false;
     allRelaysOff();
     state = PistonState::STOPPED;
     setLastError("NONE");
     publishRetained(T_SAFETY, "CLEAR");
     publishRetained(T_STATE, "STOPPED");
+    publishLive(T_COMMAND, "OK");
     publishFullStatus();
     led.solid(true);
-    Serial.println("Manual reset complete");
+    mqttLog("PUZZLE_RESET complete");
     return;
   }
 
@@ -342,6 +383,7 @@ void handlePrimaryCommand(const char* msg) {
   }
 
   setLastError("UNKNOWN_COMMAND");
+  mqttLog("ERROR: UNKNOWN_COMMAND");
   publishLive(T_INFO, "ERROR: UNKNOWN_COMMAND");
 }
 
@@ -524,16 +566,21 @@ void loop() {
   if ((state == PistonState::EXTENDING || state == PistonState::RETRACTING) &&
       (now - last_cmd_ms > CMD_TIMEOUT_MS)) {
     toStopped("TIMEOUT_AUTO_STOP");
-    Serial.println("Auto-stopped after command timeout");
+    mqttLog("Auto-stopped after command timeout");
   }
 
-  // Periodic status heartbeat
+  // Periodic heartbeat (WatchTower standard format on /status)
   if (mqtt.connected() && (now - last_status_publish_ms >= STATUS_INTERVAL_MS)) {
-    publishFullStatus();
+    publishHeartbeat();
     last_status_publish_ms = now;
   }
 
-  // Watchdog: reboot after long inactivity
+  // A connected MQTT session counts as activity: an idle prop legitimately
+  // receives no commands for most of a game. The watchdog reboot exists to
+  // recover a wedged network stack, so it must only fire after 10 minutes
+  // with NO broker connectivity.
+  if (mqtt.connected()) last_activity_ms = now;
+
   if (last_activity_ms > 0 && (now - last_activity_ms > WATCHDOG_REBOOT_MS)) {
     Serial.println("Watchdog: restarting...");
     ESP.restart();
