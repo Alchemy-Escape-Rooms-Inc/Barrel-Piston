@@ -7,7 +7,7 @@
 // IDENTITY / VERSION
 // =====================================================
 #define DEVICE_NAME "BarrelPiston"
-#define FW_VERSION  "BarrelPiston v3.2.2-S3 (Continuous Mode)"
+#define FW_VERSION  "BarrelPiston v3.2.3-S3 (Continuous Mode)"
 
 // =====================================================
 // CONFIG
@@ -86,7 +86,7 @@ bool ota_started = false;
 // Relay trigger level, switchable over MQTT (LOGIC_HIGH / LOGIC_LOW) and kept across reboots.
 //   false = active-LOW module  (ON = pin LOW,  OFF = pin released)
 //   true  = active-HIGH module (ON = pin HIGH, OFF = pin LOW)
-bool relay_active_high = false;
+bool relay_active_high = true;   // installed relay boards are high-level trigger (bench-verified 2026-11-12)
 Preferences prefs;
 
 char last_error[96] = "NONE";
@@ -606,7 +606,7 @@ void setup() {
   }
 
   prefs.begin("piston", false);
-  relay_active_high = prefs.getBool("activeHigh", false);
+  relay_active_high = prefs.getBool("activeHigh", true);
   allRelaysOff();                         // OFF level for the saved relay logic (see driveRelayPin)
 
   setLastError("NONE");
