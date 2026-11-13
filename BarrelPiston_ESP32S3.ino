@@ -1,11 +1,12 @@
 #include <WiFi.h>
 #include <PubSubClient.h>
+#include <ArduinoOTA.h>
 
 // =====================================================
 // IDENTITY / VERSION
 // =====================================================
 #define DEVICE_NAME "BarrelPiston"
-#define FW_VERSION  "BarrelPiston v3.1.0-S3 (Continuous Mode)"
+#define FW_VERSION  "BarrelPiston v3.2.0-S3 (Continuous Mode)"
 
 // =====================================================
 // CONFIG
@@ -40,6 +41,9 @@ const char* T_GPIO4_STATE = "MermaidsTale/BarrelPiston/GPIO4/State";
 const int RELAY_EXTEND_PIN  = 18;
 const int RELAY_RETRACT_PIN = 8;
 const int LED_PIN           = -1;  // Disabled for ESP32-S3
+
+// Over-the-air updates (shop MQTT protocol: mandatory on every Wi-Fi board)
+const uint16_t OTA_PORT     = 3232;
 
 // Timing
 const uint32_t INTERLOCK_GAP_MS     = 120;      // Dead time between direction changes
@@ -76,6 +80,7 @@ uint32_t next_wifi_retry_ms = 0;
 uint32_t next_mqtt_retry_ms = 0;
 uint32_t wifi_backoff_ms = 1000;
 uint32_t mqtt_backoff_ms = 1000;
+bool ota_started = false;
 
 char last_error[96] = "NONE";
 
@@ -189,10 +194,11 @@ void publishFullStatus() {
   snprintf(
     info,
     sizeof(info),
-    "%s | Device=%s | IP=%s | State=%s | Safety=%s | ExtendRelay=%s | RetractRelay=%s | RSSI=%d",
+    "%s | Device=%s | IP=%s | OTA:%u | State=%s | Safety=%s | ExtendRelay=%s | RetractRelay=%s | RSSI=%d",
     FW_VERSION,
     DEVICE_NAME,
     WiFi.localIP().toString().c_str(),
+    (unsigned)OTA_PORT,
     stateToString(state),
     safety_latched ? "LATCHED" : "CLEAR",
     relay_extend_intended ? "ON" : "OFF",
@@ -458,8 +464,9 @@ void mqttConnectIfNeeded() {
     publishRetained(T_LASTERROR, last_error);
 
     char info[128];
-    snprintf(info, sizeof(info), "%s Ready - IP: %s", DEVICE_NAME, WiFi.localIP().toString().c_str());
+    snprintf(info, sizeof(info), "%s Ready - IP: %s OTA:%u", DEVICE_NAME, WiFi.localIP().toString().c_str(), (unsigned)OTA_PORT);
     publishRetained(T_INFO, info);
+    mqttLog(info);
 
     publishFullStatus();
     led.solid(true);
@@ -515,6 +522,31 @@ void wifiEnsureConnected() {
 }
 
 // =====================================================
+// OTA (wireless re-flash)
+// =====================================================
+void otaBeginIfNeeded() {
+  if (ota_started || WiFi.status() != WL_CONNECTED) return;
+
+  ArduinoOTA.setHostname(DEVICE_NAME);
+  ArduinoOTA.setPort(OTA_PORT);
+  ArduinoOTA.setPassword(password);  // same as the Wi-Fi password (protocol rule)
+
+  ArduinoOTA.onStart([]() {
+    // Never re-flash with a relay energized
+    allRelaysOff();
+    state = PistonState::STOPPED;
+    mqttLog("OTA update starting");
+    mqtt.loop();
+  });
+  ArduinoOTA.onEnd([]() { Serial.println("OTA: done, rebooting"); });
+  ArduinoOTA.onError([](ota_error_t e) { Serial.printf("OTA: error %u\n", (unsigned)e); });
+
+  ArduinoOTA.begin();
+  ota_started = true;
+  Serial.println("OTA: ready");
+}
+
+// =====================================================
 // SETUP / LOOP
 // =====================================================
 void setup() {
@@ -528,6 +560,8 @@ void setup() {
     led.set(300);
   }
 
+  digitalWrite(RELAY_EXTEND_PIN, HIGH);   // HIGH = relay OFF (active-LOW module)
+  digitalWrite(RELAY_RETRACT_PIN, HIGH);
   pinMode(RELAY_EXTEND_PIN, OUTPUT);
   pinMode(RELAY_RETRACT_PIN, OUTPUT);
   allRelaysOff();
@@ -548,6 +582,8 @@ void loop() {
   wifiEnsureConnected();
 
   if (WiFi.status() == WL_CONNECTED) {
+    otaBeginIfNeeded();
+    ArduinoOTA.handle();
     mqttConnectIfNeeded();
   }
 
