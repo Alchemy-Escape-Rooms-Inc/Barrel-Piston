@@ -1,12 +1,13 @@
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include <ArduinoOTA.h>
+#include <Preferences.h>
 
 // =====================================================
 // IDENTITY / VERSION
 // =====================================================
 #define DEVICE_NAME "BarrelPiston"
-#define FW_VERSION  "BarrelPiston v3.2.1-S3 (Continuous Mode)"
+#define FW_VERSION  "BarrelPiston v3.2.2-S3 (Continuous Mode)"
 
 // =====================================================
 // CONFIG
@@ -81,6 +82,12 @@ uint32_t next_mqtt_retry_ms = 0;
 uint32_t wifi_backoff_ms = 1000;
 uint32_t mqtt_backoff_ms = 1000;
 bool ota_started = false;
+
+// Relay trigger level, switchable over MQTT (LOGIC_HIGH / LOGIC_LOW) and kept across reboots.
+//   false = active-LOW module  (ON = pin LOW,  OFF = pin released)
+//   true  = active-HIGH module (ON = pin HIGH, OFF = pin LOW)
+bool relay_active_high = false;
+Preferences prefs;
 
 char last_error[96] = "NONE";
 
@@ -171,6 +178,12 @@ void setLastError(const char* msg) {
 // module's input LED/optocoupler and can hold the relay ON. Releasing the
 // pin lets the module pull its own input up to 5 V, so the relay drops out.
 void driveRelayPin(int pin, bool on) {
+  if (relay_active_high) {
+    digitalWrite(pin, on ? HIGH : LOW);
+    pinMode(pin, OUTPUT);
+    digitalWrite(pin, on ? HIGH : LOW);
+    return;
+  }
   if (on) {
     digitalWrite(pin, LOW);
     pinMode(pin, OUTPUT);
@@ -212,7 +225,7 @@ void publishFullStatus() {
   snprintf(
     info,
     sizeof(info),
-    "%s | Device=%s | IP=%s | OTA:%u | State=%s | Safety=%s | ExtendRelay=%s | RetractRelay=%s | RSSI=%d",
+    "%s | Device=%s | IP=%s | OTA:%u | State=%s | Safety=%s | ExtendRelay=%s | RetractRelay=%s | Logic=%s | RSSI=%d",
     FW_VERSION,
     DEVICE_NAME,
     WiFi.localIP().toString().c_str(),
@@ -221,6 +234,7 @@ void publishFullStatus() {
     safety_latched ? "LATCHED" : "CLEAR",
     relay_extend_intended ? "ON" : "OFF",
     relay_retract_intended ? "ON" : "OFF",
+    relay_active_high ? "HIGH" : "LOW",
     WiFi.RSSI()
   );
   publishRetained(T_INFO, info);
@@ -393,6 +407,19 @@ void handlePrimaryCommand(const char* msg) {
 
   if (tokenEquals(msg, "STOP")) {
     toStopped("STOP_COMMAND");
+    return;
+  }
+
+  if (tokenEquals(msg, "LOGIC_HIGH") || tokenEquals(msg, "LOGIC_LOW")) {
+    // Relay module trigger level. Stop first so nothing is energized across the change.
+    allRelaysOff();
+    state = PistonState::STOPPED;
+    relay_active_high = tokenEquals(msg, "LOGIC_HIGH");
+    prefs.putBool("activeHigh", relay_active_high);
+    allRelaysOff();
+    publishRetained(T_STATE, "STOPPED");
+    publishFullStatus();
+    mqttLog(relay_active_high ? "Relay logic: active HIGH (saved)" : "Relay logic: active LOW (saved)");
     return;
   }
 
@@ -578,9 +605,9 @@ void setup() {
     led.set(300);
   }
 
-  pinMode(RELAY_EXTEND_PIN, INPUT);       // released = relay OFF (see driveRelayPin)
-  pinMode(RELAY_RETRACT_PIN, INPUT);
-  allRelaysOff();
+  prefs.begin("piston", false);
+  relay_active_high = prefs.getBool("activeHigh", false);
+  allRelaysOff();                         // OFF level for the saved relay logic (see driveRelayPin)
 
   setLastError("NONE");
 
