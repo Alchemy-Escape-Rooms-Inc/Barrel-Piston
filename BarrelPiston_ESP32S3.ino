@@ -6,7 +6,7 @@
 // IDENTITY / VERSION
 // =====================================================
 #define DEVICE_NAME "BarrelPiston"
-#define FW_VERSION  "BarrelPiston v3.2.0-S3 (Continuous Mode)"
+#define FW_VERSION  "BarrelPiston v3.2.1-S3 (Continuous Mode)"
 
 // =====================================================
 // CONFIG
@@ -164,10 +164,28 @@ void setLastError(const char* msg) {
   publishRetained(T_LASTERROR, last_error);
 }
 
+// Active-LOW relay module fed from 5 V, driven by a 3.3 V board:
+//   ON  = pin driven LOW (sinks the input LED current)
+//   OFF = pin released (INPUT, high-impedance)
+// Driving the pin HIGH only reaches 3.3 V, which leaves ~1.7 V across the
+// module's input LED/optocoupler and can hold the relay ON. Releasing the
+// pin lets the module pull its own input up to 5 V, so the relay drops out.
+void driveRelayPin(int pin, bool on) {
+  if (on) {
+    digitalWrite(pin, LOW);
+    pinMode(pin, OUTPUT);
+    digitalWrite(pin, LOW);
+  } else {
+    pinMode(pin, INPUT);
+  }
+}
+
 void setRelays(bool extend_on, bool retract_on) {
-  // Active LOW relays - LOW = ON, HIGH = OFF
-  digitalWrite(RELAY_EXTEND_PIN,  extend_on  ? LOW : HIGH);
-  digitalWrite(RELAY_RETRACT_PIN, retract_on ? LOW : HIGH);
+  // Always release before energizing so both relays are never on together
+  if (!extend_on)  driveRelayPin(RELAY_EXTEND_PIN, false);
+  if (!retract_on) driveRelayPin(RELAY_RETRACT_PIN, false);
+  if (extend_on)   driveRelayPin(RELAY_EXTEND_PIN, true);
+  if (retract_on)  driveRelayPin(RELAY_RETRACT_PIN, true);
 
   relay_extend_intended  = extend_on;
   relay_retract_intended = retract_on;
@@ -560,10 +578,8 @@ void setup() {
     led.set(300);
   }
 
-  digitalWrite(RELAY_EXTEND_PIN, HIGH);   // HIGH = relay OFF (active-LOW module)
-  digitalWrite(RELAY_RETRACT_PIN, HIGH);
-  pinMode(RELAY_EXTEND_PIN, OUTPUT);
-  pinMode(RELAY_RETRACT_PIN, OUTPUT);
+  pinMode(RELAY_EXTEND_PIN, INPUT);       // released = relay OFF (see driveRelayPin)
+  pinMode(RELAY_RETRACT_PIN, INPUT);
   allRelaysOff();
 
   setLastError("NONE");
